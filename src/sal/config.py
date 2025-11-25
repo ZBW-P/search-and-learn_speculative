@@ -63,6 +63,8 @@ class Config:
     beam_width: int = 4  # m in the paper
     num_iterations: int = 40
     lookahead: int = 0
+    small_model_path: str = None
+    target_llm: any = None
 
     # Beam search options:
     filter_duplicates: bool = False
