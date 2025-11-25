@@ -1,0 +1,11 @@
+model_path: meta-llama/Llama-3.2-3B-Instruct       # target model
+small_model_path: meta-llama/Llama-3.2-1B-Instruct # draft model
+prm_path: Skywork/Skywork-o1-Open-PRM-Qwen-2.5-1.5B
+
+approach: best_of_n_speculative
+n: 4
+search_batch_size: 25
+sort_completed: true
+filter_duplicates: true
+num_samples: 10         
+seed: 0

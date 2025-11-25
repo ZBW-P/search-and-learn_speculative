@@ -21,7 +21,7 @@ from vllm import LLM
 
 from sal.config import Config
 from sal.models.reward_models import load_prm
-from sal.search import beam_search, best_of_n, dvts,best_of_n_speculative
+from sal.search import beam_search, best_of_n, dvts,best_of_n_speculative_trans
 from sal.utils.data import get_dataset, save_dataset
 from sal.utils.parser import H4ArgumentParser
 from sal.utils.score import score
@@ -37,7 +37,7 @@ APPROACHES = {
     "beam_search": beam_search,
     "dvts": dvts,
     "best_of_n": best_of_n,
-    "best_of_n_speculative": best_of_n_speculative,
+    "best_of_n_speculative": best_of_n_speculative_trans,
 }
 
 
@@ -48,13 +48,7 @@ def main():
     approach_fn = APPROACHES[config.approach]
 
     num_gpus = torch.cuda.device_count()
-    llm = LLM(
-        model=config.model_path,
-        gpu_memory_utilization=config.gpu_memory_utilization,
-        enable_prefix_caching=True,
-        seed=config.seed,
-        tensor_parallel_size=num_gpus,
-    )
+    
     prm = load_prm(config)
        
     if config.approach == "best_of_n_speculative":
@@ -64,30 +58,32 @@ def main():
                 "best_of_n_speculative requires --small_model_path to be set."
             )
         
-        target_llm = LLM(
-            model=config.model_path,
-            gpu_memory_utilization=config.gpu_memory_utilization,
-            enable_prefix_caching=True,
-            seed=config.seed,
-            tensor_parallel_size=num_gpus,
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        # Load target model
+        target_tokenizer = AutoTokenizer.from_pretrained(config.model_path)
+        target_model = AutoModelForCausalLM.from_pretrained(
+            config.model_path,
+            torch_dtype=torch.float16,
+            device_map="auto"
         )
 
-        drafter_llm = LLM(
-            model=config.small_model_path,
-            gpu_memory_utilization=config.gpu_memory_utilization,
-            enable_prefix_caching=True,
-            seed=config.seed,
-            tensor_parallel_size=num_gpus,
+        # Load draft model
+        draft_tokenizer = AutoTokenizer.from_pretrained(config.small_model_path)
+        draft_model = AutoModelForCausalLM.from_pretrained(
+            config.small_model_path,
+            torch_dtype=torch.float16,
+            device_map="auto"
         )
-        
-        config.target_llm = target_llm
 
         fn_kwargs = {
             "config": config,
-            "llm": drafter_llm,
             "prm": prm,
+            "target_model": target_model,
+            "target_tokenizer": target_tokenizer,
+            "draft_model": draft_model,
+            "draft_tokenizer": draft_tokenizer,
         }
-
     else:
         llm = LLM(
             model=config.model_path,

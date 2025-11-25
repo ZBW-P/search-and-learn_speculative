@@ -21,6 +21,8 @@ from sal.models.reward_models import PRM
 from sal.utils.score import aggregate_scores
 from sal.search.best_of_n import best_of_n
 
+
+#Fail: Vllm kv cache length
 def best_of_n_speculative(x, config, llm, prm):
     """
     llm = drafter LLM (small model)

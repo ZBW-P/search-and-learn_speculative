@@ -24,7 +24,8 @@ from sal.utils.hub import get_dataset_revisions
 @dataclass
 class Config:
     approach: Literal["best_of_n", "beam_search", "dvts"] = "best_of_n"
-    model_path: str = "meta-llama/Llama-3.2-1B-Instruct"
+    model_path: str = "meta-llama/Llama-3.2-3B-Instruct"
+    small_model_path: str = "meta-llama/Llama-3.2-1B-Instruct"
     gpu_memory_utilization: float = (
         0.5  # vllm is allocated 0.5 of GPU memory, the PRM uses the rest
     )
@@ -37,6 +38,8 @@ class Config:
     hub_dataset_private: bool = False
     overwrite_hub_revision: bool = False
     apply_voting: bool = True
+    max_model_len: int = 8192
+    max_small_model_len: int = 4096
 
     # Dataset Related Options
     dataset_name: str = "HuggingFaceH4/MATH-500"
@@ -63,8 +66,6 @@ class Config:
     beam_width: int = 4  # m in the paper
     num_iterations: int = 40
     lookahead: int = 0
-    small_model_path: str = None
-    target_llm: any = None
 
     # Beam search options:
     filter_duplicates: bool = False
