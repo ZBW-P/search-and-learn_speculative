@@ -21,7 +21,8 @@ from vllm import LLM
 
 from sal.config import Config
 from sal.models.reward_models import load_prm
-from sal.search import beam_search, best_of_n, dvts,best_of_n_speculative_trans
+from sal.search import beam_search, best_of_n, dvts
+from sal.search.best_of_n_speculative_transformers import best_of_n_speculative_transformers
 from sal.utils.data import get_dataset, save_dataset
 from sal.utils.parser import H4ArgumentParser
 from sal.utils.score import score
@@ -37,7 +38,7 @@ APPROACHES = {
     "beam_search": beam_search,
     "dvts": dvts,
     "best_of_n": best_of_n,
-    "best_of_n_speculative": best_of_n_speculative_trans,
+    "best_of_n_speculative_transformers": best_of_n_speculative_transformers,
 }
 
 
@@ -51,11 +52,11 @@ def main():
     
     prm = load_prm(config)
        
-    if config.approach == "best_of_n_speculative":
+    if config.approach == "best_of_n_speculative_transformers":
         
         if config.small_model_path is None:
             raise ValueError(
-                "best_of_n_speculative requires --small_model_path to be set."
+                "best_of_n_speculative_transformers requires --small_model_path to be set."
             )
         
         from transformers import AutoModelForCausalLM, AutoTokenizer

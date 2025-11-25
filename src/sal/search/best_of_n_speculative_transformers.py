@@ -2,19 +2,14 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from sal.utils.score import aggregate_scores
 from sal.models.reward_models import PRM
+import numpy as np
+import time
 
 def best_of_n_speculative_transformers(
     x, config, prm: PRM,
     draft_model, draft_tokenizer,
     target_model, target_tokenizer
 ):
-    """
-    Speculative decoding using Transformers:
-    1) drafter_model generates N candidates
-    2) PRM scores them
-    3) low-score prompts fall back to target_model for regeneration
-    """
-
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     prompts = [
@@ -27,6 +22,7 @@ def best_of_n_speculative_transformers(
     drafter_completions = [[] for _ in range(batch_size)]
     drafter_tokens = [[] for _ in range(batch_size)]
 
+    t_draft_start = time.time()
     for i, prompt in enumerate(prompts):
         inputs = draft_tokenizer(prompt, return_tensors="pt").to(device)
 
@@ -46,21 +42,29 @@ def best_of_n_speculative_transformers(
 
         drafter_completions[i] = decoded
         drafter_tokens[i] = [out.shape[-1] for out in outputs]
+    t_draft_end = time.time()
+    draft_gen_time = t_draft_end - t_draft_start
 
+    t_prm1_start = time.time()
     draft_scores = prm.score(x["problem"], drafter_completions)
+    t_prm1_end = time.time()
+    prm_score_time_draft = t_prm1_end - t_prm1_start
 
     agg_scores = [
         [aggregate_scores(s, config.agg_strategy) for s in score_list]
         for score_list in draft_scores
     ]
+    max_scores = [max(s) for s in agg_scores]
+
+    T_low = np.percentile(max_scores, 30)
+    T_absolute = np.percentile(max_scores, 10)
 
     low_indices = [
-        i for i, score_list in enumerate(agg_scores)
-        if max(score_list) < config.spec_threshold
+        i for i, sc in enumerate(max_scores)
+        if sc < T_low or sc < T_absolute
     ]
 
     if len(low_indices) == 0:
-        # best-of-n prediction
         pred = [
             drafter_completions[i][torch.argmax(torch.tensor(agg_scores[i]))]
             for i in range(batch_size)
@@ -69,12 +73,17 @@ def best_of_n_speculative_transformers(
             "completions": drafter_completions,
             "scores": draft_scores,
             "pred": pred,
-            "completion_tokens": drafter_tokens
+            "completion_tokens": drafter_tokens,
+            "draft_gen_time": draft_gen_time,
+            "prm_score_time_draft": prm_score_time_draft,
+            "target_gen_time": 0.0,
+            "prm_score_time_target": 0.0,
+            "total_time": draft_gen_time + prm_score_time_draft,
         }
 
+    t_target_start = time.time()
     fallback_completions = []
     fallback_tokens = []
-    fallback_scores = []
 
     for idx in low_indices:
         prompt = prompts[idx]
@@ -96,9 +105,15 @@ def best_of_n_speculative_transformers(
 
         fallback_completions.append(decoded)
         fallback_tokens.append([out.shape[-1] for out in outputs])
+    t_target_end = time.time()
+    target_gen_time = t_target_end - t_target_start
 
     low_problems = [x["problem"][i] for i in low_indices]
-    fallback_scores = prm.score(low_problems, fallback_completions)
+
+    t_prm2_start = time.time()
+    fallback_scores_raw = prm.score(low_problems, fallback_completions)
+    t_prm2_end = time.time()
+    prm_score_time_target = t_prm2_end - t_prm2_start
 
     final_completions = []
     final_scores = []
@@ -108,7 +123,7 @@ def best_of_n_speculative_transformers(
     for i in range(batch_size):
         if i in low_indices:
             final_completions.append(fallback_completions[fb_ptr])
-            final_scores.append(fallback_scores[fb_ptr])
+            final_scores.append(fallback_scores_raw[fb_ptr])
             final_tokens.append(fallback_tokens[fb_ptr])
             fb_ptr += 1
         else:
@@ -124,9 +139,17 @@ def best_of_n_speculative_transformers(
         for i in range(batch_size)
     ]
 
+    total_time = draft_gen_time+prm_score_time_draft+target_gen_time+prm_score_time_target
+
     return {
         "completions": final_completions,
         "scores": final_scores,
         "pred": final_pred,
         "completion_tokens": final_tokens,
+        # Timing results
+        "draft_gen_time": draft_gen_time,
+        "prm_score_time_draft": prm_score_time_draft,
+        "target_gen_time": target_gen_time,
+        "prm_score_time_target": prm_score_time_target,
+        "total_time": total_time,
     }
