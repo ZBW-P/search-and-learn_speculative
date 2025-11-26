@@ -4,289 +4,237 @@ import numpy as np
 from sal.utils.score import aggregate_scores
 from sal.models.reward_models import PRM
 
+# ---------------------------
+# 防止 OOM：只保留最后 max_ctx tokens
+# ---------------------------
+def truncate_context(text, tokenizer, max_ctx=2048):
+    ids = tokenizer(text, return_tensors="pt").input_ids[0]
+    if len(ids) <= max_ctx:
+        return text
+    ids = ids[-max_ctx:]
+    return tokenizer.decode(ids, skip_special_tokens=True)
+
+
 def best_of_n_switch_roles(
     x, config, prm: PRM,
-    big_model, big_tok,
-    small_model, small_tok,
-    warmup_tokens=200,      # Stage 1: 大模型起手长度
-    score_delta=0.05,       # 中档阈值：small 比 big 最多能差多少还算“勉强可以”
-    high_margin=0.0,        # 高档阈值：small >= big_s + high_margin 视为“很好”
-    chunk_size=32,          # 仅对中档样本做 chunk 级 verify
+    draft_model, draft_tokenizer,
+    target_model, target_tokenizer,
+    warmup_tokens=128,
+    score_delta=0.05,
+    max_prm_context=256,
 ):
     device = "cuda" if torch.cuda.is_available() else "cpu"
-
     prompts = [f"{config.system_prompt}\n{p}" for p in x["problem"]]
     batch_size = len(prompts)
 
-    # 每个样本最终要返回的 completions / scores
-    final_completions = [[] for _ in range(batch_size)]
-    final_scores = [[] for _ in range(batch_size)]
-    final_tokens = [[] for _ in range(batch_size)]
-    final_pred = [None] * batch_size
-
-    # 记录时间（batched=True 时要返回 list）
-    t_big_gen = 0.0
-    t_small_gen = 0.0
-    t_prm = 0.0
-
     # ---------------------------
-    # Stage 1: big_model warm-up
+    # prepare output storage
     # ---------------------------
+    drafter_completions = [[] for _ in range(batch_size)]
+    drafter_tokens = [[] for _ in range(batch_size)]
+
+    t_draft = 0
+    t_target = 0
+    t_prm = 0
+
+    # ======================================================
+    # Stage 1: draft model warm-up
+    # ======================================================
+    warm_texts = []
     t0 = time.time()
-    warmup_outputs = []
+
     for prompt in prompts:
-        inputs = big_tok(prompt, return_tensors="pt").to(device)
-        with torch.inference_mode():
-            out = big_model.generate(
-                **inputs,
-                max_new_tokens=warmup_tokens,
-                temperature=config.temperature,
-                top_p=config.top_p,
-                do_sample=True,
-                num_return_sequences=1,
-            )
-        warmup_outputs.append(out[0])
+        inp = draft_tokenizer(prompt, return_tensors="pt").to(device)
+        out = draft_model.generate(
+            **inp,
+            max_new_tokens=warmup_tokens,
+            do_sample=True,
+            top_p=config.top_p,
+            temperature=config.temperature,
+            num_return_sequences=1,
+        )
+        warm_texts.append(
+            draft_tokenizer.decode(out[0], skip_special_tokens=True)
+        )
+
+    t_draft += time.time() - t0
+
+    # ======================================================
+    # Stage 1 PRM baseline
+    # ======================================================
     t1 = time.time()
-    t_big_gen += (t1 - t0)
+    warm_scores_raw = prm.score(x["problem"], [[w] for w in warm_texts])
+    t_prm += time.time() - t1
 
-    warmup_texts = [
-        big_tok.decode(ids, skip_special_tokens=True)
-        for ids in warmup_outputs
+    warm_scores = [
+        aggregate_scores(sc[0], config.agg_strategy)
+        for sc in warm_scores_raw
     ]
 
-    # ---------------------------
-    # Stage 1 scoring: baseline
-    # ---------------------------
+    # ======================================================
+    # Stage 2: draft model produces full candidate
+    # ======================================================
+    full_draft_texts = []
+    full_draft_tokens = []
+
     t2 = time.time()
-    big_scores_raw = prm.score(x["problem"], [[txt] for txt in warmup_texts])
-    t3 = time.time()
-    t_prm += (t3 - t2)
+    for w in warm_texts:
+        ctx = truncate_context(w, draft_tokenizer, max_ctx=2048)
+        inp = draft_tokenizer(ctx, return_tensors="pt").to(device)
+        out = draft_model.generate(
+            **inp,
+            max_new_tokens=config.max_small_model_len - warmup_tokens,
+            do_sample=True,
+            top_p=config.top_p,
+            temperature=config.temperature,
+            num_return_sequences=config.n,
+        )
+        decoded = [
+            draft_tokenizer.decode(o, skip_special_tokens=True)
+            for o in out
+        ]
+        full_draft_texts.append(decoded)
+        full_draft_tokens.append([o.shape[-1] for o in out])
 
-    big_baseline_scores = [
-        aggregate_scores(score_list[0], config.agg_strategy)
-        for score_list in big_scores_raw
+    t_draft += time.time() - t2
+
+    # ======================================================
+    # Stage 2 PRM score draft
+    # ======================================================
+    # PRM 可能 OOM——所以 sliding window
+    def shorten_for_prm(text):
+        ids = draft_tokenizer(text, return_tensors="pt").input_ids[0]
+        if len(ids) <= max_prm_context:
+            return text
+        ids = ids[-max_prm_context:]
+        return draft_tokenizer.decode(ids, skip_special_tokens=True)
+
+    short_draft = [[shorten_for_prm(t) for t in cand]
+                   for cand in full_draft_texts]
+
+    t3 = time.time()
+    draft_scores_raw = prm.score(x["problem"], short_draft)
+    t_prm += time.time() - t3
+
+    agg_scores = [
+        [aggregate_scores(s, config.agg_strategy) for s in s_list]
+        for s_list in draft_scores_raw
+    ]
+    max_scores = [max(row) for row in agg_scores]
+
+    # ======================================================
+    # Stage 2: 判断 fallback
+    # ======================================================
+    T_bad = np.percentile(max_scores, 30)       # your logic
+    T_abs = np.percentile(max_scores, 10)
+
+    fallback_indices = [
+        i for i, sc in enumerate(max_scores)
+        if sc < T_bad or sc < T_abs
     ]
 
-    # ------------------------------------------------------
-    # Stage 2: small_model 完整生成一版，评估整体表现
-    # ------------------------------------------------------
-    t4 = time.time()
-    small_cont_texts = []
-    small_cont_tokens = []
+    if not fallback_indices:
+        # pure fast path
+        pred = [
+            full_draft_texts[i][torch.argmax(torch.tensor(agg_scores[i]))]
+            for i in range(batch_size)
+        ]
+        return {
+            "completions": full_draft_texts,
+            "scores": draft_scores_raw,
+            "pred": pred,
+            "completion_tokens": full_draft_tokens,
+            "draft_gen_time": [t_draft] * batch_size,
+            "prm_score_time_draft": [t_prm] * batch_size,
+            "target_gen_time": [0.0] * batch_size,
+            "prm_score_time_target": [0.0] * batch_size,
+            "total_time": [t_draft + t_prm] * batch_size,
+        }
 
-    for warmup_txt in warmup_texts:
-        inputs = small_tok(warmup_txt, return_tensors="pt").to(device)
-        with torch.inference_mode():
-            out = small_model.generate(
-                **inputs,
-                max_new_tokens=config.max_small_model_len - warmup_tokens,
-                temperature=config.temperature,
-                top_p=config.top_p,
-                do_sample=True,
-                num_return_sequences=1,
-            )
-        cont_ids = out[0]
-        cont_txt = small_tok.decode(cont_ids, skip_special_tokens=True)
-        small_cont_texts.append(cont_txt)
-        small_cont_tokens.append(cont_ids.shape[-1])
+    # ======================================================
+    # Stage 3: fallback only for low-quality samples
+    # ======================================================
+    fb_texts = []
+    fb_tokens = []
+    low_problems = [x["problem"][i] for i in fallback_indices]
+
+    t4 = time.time()
+    for idx in fallback_indices:
+        w = warm_texts[idx]
+        ctx = truncate_context(w, target_tokenizer, max_ctx=4096)
+        inp = target_tokenizer(ctx, return_tensors="pt").to(device)
+        out = target_model.generate(
+            **inp,
+            max_new_tokens=config.max_model_len - warmup_tokens,
+            do_sample=True,
+            top_p=config.top_p,
+            temperature=config.temperature,
+            num_return_sequences=config.n,
+        )
+        decoded = [
+            target_tokenizer.decode(o, skip_special_tokens=True)
+            for o in out
+        ]
+        fb_texts.append(decoded)
+        fb_tokens.append([o.shape[-1] for o in out])
+
+    t_target += time.time() - t4
+
+    # sliding window PRM
+    def shorten_fb(texts):
+        r = []
+        for t in texts:
+            ids = target_tokenizer(t, return_tensors="pt").input_ids[0]
+            if len(ids) <= max_prm_context:
+                r.append(t)
+            else:
+                ids = ids[-max_prm_context:]
+                r.append(target_tokenizer.decode(ids, skip_special_tokens=True))
+        return r
+
+    fb_texts_prm = [shorten_fb(group) for group in fb_texts]
 
     t5 = time.time()
-    t_small_gen += (t5 - t4)
+    fb_scores_raw = prm.score(low_problems, fb_texts_prm)
+    t_prm += time.time() - t5
 
-    small_full_texts = [
-        warmup_texts[i] + "\n" + small_cont_texts[i]
+    # ======================================================
+    # Merge everything
+    # ======================================================
+    merged_completions = []
+    merged_scores = []
+    merged_tokens = []
+
+    fb_ptr = 0
+    for i in range(batch_size):
+        if i in fallback_indices:
+            merged_completions.append(fb_texts[fb_ptr])
+            merged_scores.append(fb_scores_raw[fb_ptr])
+            merged_tokens.append(fb_tokens[fb_ptr])
+            fb_ptr += 1
+        else:
+            merged_completions.append(full_draft_texts[i])
+            merged_scores.append(draft_scores_raw[i])
+            merged_tokens.append(full_draft_tokens[i])
+
+    final_pred = [
+        merged_completions[i][torch.argmax(torch.tensor(
+            [aggregate_scores(s, config.agg_strategy)
+             for s in merged_scores[i]]
+        ))]
         for i in range(batch_size)
     ]
 
-    t6 = time.time()
-    small_scores_raw = prm.score(x["problem"], [[txt] for txt in small_full_texts])
-    t7 = time.time()
-    t_prm += (t7 - t6)
-
-    small_scores = [
-        aggregate_scores(score_list[0], config.agg_strategy)
-        for score_list in small_scores_raw
-    ]
-
-    # ------------------------------------------------------
-    # 三档分类：
-    #   good_small: small 表现非常好 → Stage3 直接用 small 全段（只总验证一次）
-    #   mid_small:  small 跟 big 还算接近 → Stage3 用 chunk-level verify
-    #   bad_small:  small 明显不行 → Stage3 直接交给 big
-    # ------------------------------------------------------
-    tier = [""] * batch_size
-    for i in range(batch_size):
-        big_s = big_baseline_scores[i]
-        small_s = small_scores[i]
-
-        if small_s >= big_s + high_margin:
-            tier[i] = "good_small"
-        elif small_s >= big_s - score_delta:
-            tier[i] = "mid_small"
-        else:
-            tier[i] = "bad_small"
-
-    # 先把 good_small / bad_small 直接处理掉，只给 mid_small 做 chunk 级 verify
-    # ------------------------------------------------------
-    # Stage 3A: good_small —— 直接采纳 small 全段输出
-    # ------------------------------------------------------
-    for i in range(batch_size):
-        if tier[i] == "good_small":
-            final_completions[i] = [small_full_texts[i]]
-            final_scores[i] = [small_scores_raw[i][0]]  # 原始 PRM 分布
-            final_tokens[i] = [small_cont_tokens[i]]
-            final_pred[i] = small_full_texts[i]
-
-    # ------------------------------------------------------
-    # Stage 3B: bad_small —— 完全用 big_model 重新生成
-    # ------------------------------------------------------
-    t8 = time.time()
-    for i in range(batch_size):
-        if tier[i] == "bad_small":
-            inputs = big_tok(warmup_texts[i], return_tensors="pt").to(device)
-            with torch.inference_mode():
-                out = big_model.generate(
-                    **inputs,
-                    max_new_tokens=config.max_model_len - warmup_tokens,
-                    temperature=config.temperature,
-                    top_p=config.top_p,
-                    do_sample=True,
-                    num_return_sequences=1,
-                )
-            full_ids = out[0]
-            full_txt = big_tok.decode(full_ids, skip_special_tokens=True)
-
-            # 用整段 big 结果打分
-            t9 = time.time()
-            full_score_raw = prm.score([x["problem"][i]], [[full_txt]])
-            t10 = time.time()
-            t_prm += (t10 - t9)
-
-            final_completions[i] = [full_txt]
-            final_scores[i] = [full_score_raw[0][0]]
-            final_tokens[i] = [full_ids.shape[-1]]
-            final_pred[i] = full_txt
-    t_big_gen += (time.time() - t8)
-
-    # ------------------------------------------------------
-    # Stage 3C: mid_small —— chunk 级 speculative verify
-    #    思路：
-    #      从 warmup_texts[i] 起步：
-    #      循环：
-    #         small 生成 chunk_size
-    #         PRM 打分与 big_baseline 对比
-    #           若 OK → 接受 small chunk
-    #           若不 OK → fallback big 生成同样大小 chunk
-    #                     并更新 baseline（big 的 chunk 分数）
-    # ------------------------------------------------------
-    max_new_tokens = config.max_model_len - warmup_tokens
-    max_chunks = max_new_tokens // chunk_size
-
-    for i in range(batch_size):
-        if tier[i] != "mid_small":
-            continue
-
-        cur_text = warmup_texts[i]
-        baseline = big_baseline_scores[i]
-
-        chunk_scores = []
-
-        for k in range(max_chunks):
-            # 阶段性 delta，可以更细化（early/mid/late）
-            if k < 4:
-                delta = score_delta * 0.6   # 前期严格一点
-            elif k < 10:
-                delta = score_delta         # 中段正常
-            else:
-                delta = score_delta * 1.5   # 后段放松一点
-
-            # small 尝试一个 chunk
-            t_small_start = time.time()
-            inputs_small = small_tok(cur_text, return_tensors="pt").to(device)
-            with torch.inference_mode():
-                out_small = small_model.generate(
-                    **inputs_small,
-                    max_new_tokens=chunk_size,
-                    temperature=config.temperature,
-                    top_p=config.top_p,
-                    do_sample=True,
-                    num_return_sequences=1,
-                )
-            t_small_gen += time.time() - t_small_start
-
-            small_chunk_txt = small_tok.decode(out_small[0], skip_special_tokens=True)
-
-            # 仅对这个 chunk（或者 cur_text+chunk，都可以）做 PRM
-            t_prm_start = time.time()
-            small_chunk_score_raw = prm.score(
-                [x["problem"][i]],
-                [[small_chunk_txt]],
-            )
-            t_prm += time.time() - t_prm_start
-
-            small_chunk_score = aggregate_scores(
-                small_chunk_score_raw[0][0],
-                config.agg_strategy
-            )
-
-            # 判断 small 的 chunk 是否可以接受
-            if small_chunk_score >= baseline - delta:
-                # 接受 small chunk
-                cur_text = cur_text + " " + small_chunk_txt
-                chunk_scores.append(small_chunk_score)
-            else:
-                # fallback：用 big_model 生成同样规模的 chunk
-                t_big_start = time.time()
-                inputs_big = big_tok(cur_text, return_tensors="pt").to(device)
-                with torch.inference_mode():
-                    out_big = big_model.generate(
-                        **inputs_big,
-                        max_new_tokens=chunk_size,
-                        temperature=config.temperature,
-                        top_p=config.top_p,
-                        do_sample=True,
-                        num_return_sequences=1,
-                    )
-                t_big_gen += time.time() - t_big_start
-
-                big_chunk_txt = big_tok.decode(out_big[0], skip_special_tokens=True)
-
-                # 用 big chunk 更新 baseline（big 更可信）
-                t_prm_start2 = time.time()
-                big_chunk_score_raw = prm.score(
-                    [x["problem"][i]],
-                    [[big_chunk_txt]],
-                )
-                t_prm += time.time() - t_prm_start2
-
-                big_chunk_score = aggregate_scores(
-                    big_chunk_score_raw[0][0],
-                    config.agg_strategy
-                )
-                baseline = big_chunk_score
-                chunk_scores.append(big_chunk_score)
-                cur_text = cur_text + " " + big_chunk_txt
-
-        # mid_small 的最终结果
-        final_pred[i] = cur_text
-        final_completions[i] = [cur_text]
-        # 这里简单用最后 baseline 或 chunk_scores 平均做 summary
-        if len(chunk_scores) > 0:
-            final_scores[i] = [chunk_scores]
-        else:
-            final_scores[i] = [[baseline]]
-        final_tokens[i] = [len(cur_text.split())]
-
-    total_time = t_big_gen + t_small_gen + t_prm
+    total_time = t_draft + t_target + t_prm
 
     return {
-        "completions": final_completions,
-        "scores": final_scores,
+        "completions": merged_completions,
+        "scores": merged_scores,
         "pred": final_pred,
-        "completion_tokens": final_tokens,
-        "big_gen_time": [t_big_gen] * batch_size,
-        "small_gen_time": [t_small_gen] * batch_size,
-        "prm_time": [t_prm] * batch_size,
+        "completion_tokens": merged_tokens,
+        "draft_gen_time": [t_draft] * batch_size,
+        "prm_score_time_draft": [t_prm] * batch_size,
+        "target_gen_time": [t_target] * batch_size,
+        "prm_score_time_target": [0.0] * batch_size,
         "total_time": [total_time] * batch_size,
-        "tier": tier,  # 方便你分析三种策略各自时间/效果
     }
