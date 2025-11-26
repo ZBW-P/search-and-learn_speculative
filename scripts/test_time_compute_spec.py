@@ -23,6 +23,7 @@ from sal.config import Config
 from sal.models.reward_models import load_prm
 from sal.search import beam_search, best_of_n, dvts
 from sal.search.best_of_n_speculative_transformers import best_of_n_speculative_transformers
+from sal.search.best_of_n_switch_roles import best_of_n_switch_roles
 from sal.utils.data import get_dataset, save_dataset
 from sal.utils.parser import H4ArgumentParser
 from sal.utils.score import score
@@ -39,6 +40,7 @@ APPROACHES = {
     "dvts": dvts,
     "best_of_n": best_of_n,
     "best_of_n_speculative_transformers": best_of_n_speculative_transformers,
+    "best_of_n_switch_roles": best_of_n_switch_roles, 
 }
 
 
@@ -84,6 +86,39 @@ def main():
             "target_tokenizer": target_tokenizer,
             "draft_model": draft_model,
             "draft_tokenizer": draft_tokenizer,
+        }
+    elif config.approach == "best_of_n_switch_roles":
+
+        if config.small_model_path is None:
+            raise ValueError(
+                "best_of_n_switch_roles requires --small_model_path to be set."
+            )
+
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        # --- Load BIG model (high-quality warm-up generator) ---
+        big_tokenizer = AutoTokenizer.from_pretrained(config.model_path)
+        big_model = AutoModelForCausalLM.from_pretrained(
+            config.model_path,
+            torch_dtype=torch.float16,
+            device_map="auto"
+        )
+
+        # --- Load SMALL model (fast generator / fallback) ---
+        small_tokenizer = AutoTokenizer.from_pretrained(config.small_model_path)
+        small_model = AutoModelForCausalLM.from_pretrained(
+            config.small_model_path,
+            torch_dtype=torch.float16,
+            device_map="auto"
+        )
+
+        fn_kwargs = {
+            "config": config,
+            "prm": prm,
+            "big_model": big_model,
+            "big_tok": big_tokenizer,
+            "small_model": small_model,
+            "small_tok": small_tokenizer,
         }
     else:
         llm = LLM(
