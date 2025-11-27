@@ -9,3 +9,4 @@ sort_completed: true
 filter_duplicates: true
 num_samples: 10         
 seed: 0
+output_dir: /scratch/qh2262/search-and-learn_speculative

@@ -23,9 +23,14 @@ def compute_logprob(model, tokenizer, prompt_text, candidate_text):
     target_ids[:, :prompt_len] = -100  # ignore_index
 
     with torch.no_grad():
-        out = model(input_ids=input_ids, labels=target_ids)
+        logits = model(input_ids=input_ids).logits
         # out.loss 是 masked 的 cross entropy
-        neg_log_likelihood = out.loss.item()
+    log_probs = torch.log_softmax(logits[:, :-1, :], dim=-1)
+    target_tokens = target_ids[:, 1:]
+
+    mask = target_tokens != -100
+    selected = log_probs[0].gather(1, target_tokens.unsqueeze(-1)).squeeze(-1)
+    neg_log_likelihood = -selected[mask].mean().item()
 
     # 越大越好，所以取 logprob = - loss
     return -neg_log_likelihood
