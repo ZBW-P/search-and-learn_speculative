@@ -7,6 +7,6 @@ n: 4
 search_batch_size: 25
 sort_completed: true
 filter_duplicates: true
-num_samples: 10         
+num_samples: 100         
 seed: 0
 output_dir: /scratch/qh2262/search-and-learn_speculative

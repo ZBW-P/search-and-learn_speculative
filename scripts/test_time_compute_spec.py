@@ -23,8 +23,12 @@ from sal.config import Config
 from sal.models.reward_models import load_prm
 from sal.search import beam_search, best_of_n, dvts
 from sal.search.best_of_n_speculative_transformers import best_of_n_speculative_transformers
-from sal.search.best_of_n_switch_roles import best_of_n_switch_roles
-from sal.search.best_of_n_switch_roles_Traget import best_of_n_switch_roles_Traget
+from sal.search.best_of_n_switch_roles_small_big import best_of_n_switch_roles_small_big
+from sal.search.best_of_n_switch_roles_big_small import best_of_n_switch_roles_big_small
+from sal.search.best_of_n_switch_roles_big_small_big import best_of_n_switch_roles_big_small_big
+from sal.search.best_of_n_switch_roles_big_small_big_vllm import (
+    best_of_n_switch_roles_big_small_big_vllm,
+)
 from sal.utils.data import get_dataset, save_dataset
 from sal.utils.parser import H4ArgumentParser
 from sal.utils.score import score
@@ -41,8 +45,10 @@ APPROACHES = {
     "dvts": dvts,
     "best_of_n": best_of_n,
     "best_of_n_speculative_transformers": best_of_n_speculative_transformers,
-    "best_of_n_switch_roles": best_of_n_switch_roles, 
-    "best_of_n_switch_roles_Traget":best_of_n_switch_roles_Traget,
+    "best_of_n_switch_roles_small_big": best_of_n_switch_roles_small_big, 
+    "best_of_n_switch_roles_big_small":best_of_n_switch_roles_big_small,
+    "best_of_n_switch_roles_big_small_big": best_of_n_switch_roles_big_small_big,
+    "best_of_n_switch_roles_big_small_big_vllm": best_of_n_switch_roles_big_small_big_vllm,
 }
 
 
@@ -89,11 +95,11 @@ def main():
             "draft_model": draft_model,
             "draft_tokenizer": draft_tokenizer,
         }
-    elif config.approach == "best_of_n_switch_roles":
+    elif config.approach == "best_of_n_switch_roles_small_big":
 
         if config.small_model_path is None:
             raise ValueError(
-                "best_of_n_switch_roles requires --small_model_path to be set."
+                "best_of_n_switch_roles_small_big requires --small_model_path to be set."
             )
 
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -117,16 +123,16 @@ def main():
         fn_kwargs = {
             "config": config,
             "prm": prm,
-            "draft_model": big_model,
-            "draft_tokenizer": big_tokenizer,
-            "target_model": small_model,
-            "target_tokenizer": small_tokenizer,
+            "draft_model": small_model,
+            "draft_tokenizer": small_tokenizer,
+            "target_model": big_model,
+            "target_tokenizer": big_tokenizer,
         }
-    elif config.approach == "best_of_n_switch_roles_Traget":
+    elif config.approach == "best_of_n_switch_roles_big_small":
 
         if config.small_model_path is None:
             raise ValueError(
-                "best_of_n_switch_roles_Traget requires --small_model_path to be set."
+                "best_of_n_switch_roles_big_small requires --small_model_path to be set."
             )
 
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -155,12 +161,65 @@ def main():
             "small_model": small_model,
             "small_tok": small_tokenizer,
         }
+    elif config.approach == "best_of_n_switch_roles_big_small_big":
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+    
+        big_tok = AutoTokenizer.from_pretrained(config.model_path)
+        big_model = AutoModelForCausalLM.from_pretrained(
+            config.model_path,
+            torch_dtype=torch.float16,
+            device_map="auto",
+        )
+    
+        small_tok = AutoTokenizer.from_pretrained(config.small_model_path)
+        small_model = AutoModelForCausalLM.from_pretrained(
+            config.small_model_path,
+            torch_dtype=torch.float16,
+            device_map="auto",
+        )
+    
+        fn_kwargs = {
+            "config": config,
+            "prm": prm,
+            "big_model": big_model,
+            "big_tok": big_tok,
+            "small_model": small_model,
+            "small_tok": small_tok,
+        }
+    elif config.approach == "best_of_n_switch_roles_big_small_big_vllm":
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from vllm import LLM
+    
+        big_llm = LLM(
+            model=config.model_path,
+            gpu_memory_utilization=config.gpu_memory_utilization,
+            max_model_len=config.max_model_len,
+            dtype="bfloat16",
+            seed=config.seed,
+        )
+    
+        small_tok = AutoTokenizer.from_pretrained(config.small_model_path)
+        small_model = AutoModelForCausalLM.from_pretrained(
+            config.small_model_path,
+            torch_dtype=torch.float16,
+            device_map="auto",
+        )
+    
+        fn_kwargs = {
+            "config": config,
+            "prm": prm,
+            "big_llm": big_llm,
+            "small_model": small_model,
+            "small_tok": small_tok,
+        }
     else:
+        from vllm import LLM
         llm = LLM(
             model=config.model_path,
             gpu_memory_utilization=config.gpu_memory_utilization,
             enable_prefix_caching=True,
             seed=config.seed,
+            max_model_len=config.max_model_len,
             tensor_parallel_size=num_gpus,
         )
 
