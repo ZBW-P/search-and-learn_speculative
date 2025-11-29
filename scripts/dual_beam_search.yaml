@@ -1,0 +1,17 @@
+model_path: meta-llama/Llama-3.2-3B-Instruct
+small_model_path: ./meta-llama/Llama-3.2-3B-Instruct-GPTQ-8bit
+prm_path: Skywork/Skywork-o1-Open-PRM-Qwen-2.5-1.5B
+
+approach: beam_search_big_small_big
+n: 4
+search_batch_size: 1
+sort_completed: true
+filter_duplicates: true
+num_samples: 10
+seed: 0
+output_dir: /scratch/qh2262/search-and-learn_speculative
+
+# Dual-beam-search settings
+big_warmup_iters: 2
+switch_prm_threshold: 0.20
+fallback_prm_threshold: 0.10

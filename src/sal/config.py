@@ -70,6 +70,10 @@ class Config:
     # Beam search options:
     filter_duplicates: bool = False
     sort_completed: bool = False
+    
+    big_warmup_iters: int = 2 
+    switch_prm_threshold: float = 0.20 
+    fallback_prm_threshold: float = 0.10   
 
     def __post_init__(self):
         if self.approach == "dvts":

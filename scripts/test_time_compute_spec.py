@@ -29,6 +29,9 @@ from sal.search.best_of_n_switch_roles_big_small_big import best_of_n_switch_rol
 from sal.search.best_of_n_switch_roles_big_small_big_vllm import (
     best_of_n_switch_roles_big_small_big_vllm,
 )
+from sal.search.beam_search_big_small_big import (
+    dual_beam_search,
+)
 from sal.utils.data import get_dataset, save_dataset
 from sal.utils.parser import H4ArgumentParser
 from sal.utils.score import score
@@ -49,6 +52,7 @@ APPROACHES = {
     "best_of_n_switch_roles_big_small":best_of_n_switch_roles_big_small,
     "best_of_n_switch_roles_big_small_big": best_of_n_switch_roles_big_small_big,
     "best_of_n_switch_roles_big_small_big_vllm": best_of_n_switch_roles_big_small_big_vllm,
+    "beam_search_big_small_big": dual_beam_search,
 }
 
 
@@ -211,6 +215,39 @@ def main():
             "big_llm": big_llm,
             "small_model": small_model,
             "small_tok": small_tok,
+        }
+    elif config.approach == "beam_search_big_small_big":
+        from vllm import LLM
+
+        if config.small_model_path is None:
+            raise ValueError(
+                "beam_search_big_small_big requires --small_model_path to be set."
+            )
+
+        # ---- Load Big Model (vLLM) ----
+        big_llm = LLM(
+            model=config.model_path,
+            gpu_memory_utilization=config.gpu_memory_utilization,
+            max_model_len=config.max_model_len,
+            enable_prefix_caching=True,
+            seed=config.seed,
+            dtype="bfloat16",
+        )
+
+        small_llm = LLM(
+            model=config.small_model_path,
+            gpu_memory_utilization=config.gpu_memory_utilization,
+            max_model_len=config.max_model_len,
+            enable_prefix_caching=True,
+            seed=config.seed,
+            dtype="auto",
+        )
+
+        fn_kwargs = {
+            "config": config,
+            "prm": prm,
+            "big_llm": big_llm,
+            "small_llm": small_llm,
         }
     else:
         from vllm import LLM
